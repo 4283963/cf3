@@ -5,6 +5,8 @@ const BillingRule = require('./BillingRule')(sequelize);
 const BillingOrder = require('./BillingOrder')(sequelize);
 const WalletTransaction = require('./WalletTransaction')(sequelize);
 const DeviceSession = require('./DeviceSession')(sequelize);
+const DeviceFaultAlert = require('./DeviceFaultAlert')(sequelize);
+const OrderInterruption = require('./OrderInterruption')(sequelize);
 
 User.hasMany(BillingOrder, {
   foreignKey: 'userId',
@@ -54,6 +56,30 @@ BillingOrder.belongsTo(DeviceSession, {
   as: 'deviceSession',
 });
 
+DeviceFaultAlert.hasMany(OrderInterruption, {
+  foreignKey: 'alertId',
+  sourceKey: 'alertId',
+  as: 'interruptions',
+});
+
+OrderInterruption.belongsTo(DeviceFaultAlert, {
+  foreignKey: 'alertId',
+  targetKey: 'alertId',
+  as: 'faultAlert',
+});
+
+BillingOrder.hasMany(OrderInterruption, {
+  foreignKey: 'orderNo',
+  sourceKey: 'orderNo',
+  as: 'interruptions',
+});
+
+OrderInterruption.belongsTo(BillingOrder, {
+  foreignKey: 'orderNo',
+  targetKey: 'orderNo',
+  as: 'order',
+});
+
 module.exports = {
   sequelize,
   User,
@@ -61,4 +87,6 @@ module.exports = {
   BillingOrder,
   WalletTransaction,
   DeviceSession,
+  DeviceFaultAlert,
+  OrderInterruption,
 };

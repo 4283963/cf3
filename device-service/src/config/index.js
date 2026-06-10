@@ -32,4 +32,11 @@ module.exports = {
   },
 
   internalApiToken: process.env.INTERNAL_API_TOKEN || 'dev-internal-token-2024',
+
+  billingService: {
+    baseUrl: process.env.BILLING_SERVICE_BASE_URL || 'http://127.0.0.1:3002',
+    connectTimeout: parseInt(process.env.BILLING_CONNECT_TIMEOUT, 10) || 1500,
+    readTimeout: parseInt(process.env.BILLING_READ_TIMEOUT, 10) || 2000,
+    maxRetries: parseInt(process.env.BILLING_RETRY_MAX, 10) || 1,
+  },
 };

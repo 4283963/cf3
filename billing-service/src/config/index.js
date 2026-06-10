@@ -3,6 +3,11 @@ require('dotenv').config();
 module.exports = {
   port: parseInt(process.env.PORT, 10) || 3002,
   nodeEnv: process.env.NODE_ENV || 'development',
+  internalApiToken: process.env.INTERNAL_API_TOKEN || 'dev-internal-token-2024',
+
+  billingService: {
+    baseUrl: process.env.BILLING_SERVICE_BASE_URL || 'http://127.0.0.1:3002',
+  },
 
   database: {
     host: process.env.DB_HOST || '127.0.0.1',

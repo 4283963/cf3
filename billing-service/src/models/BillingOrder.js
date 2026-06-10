@@ -85,11 +85,18 @@ module.exports = (sequelize) => {
         field: 'actual_amount',
         comment: '实际扣款金额（元）',
       },
+      refundAmount: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: false,
+        defaultValue: 0.0,
+        field: 'refund_amount',
+        comment: '退款金额（元）',
+      },
       status: {
         type: DataTypes.TINYINT,
         allowNull: false,
         defaultValue: 1,
-        comment: '1-计费中，2-待扣款，3-已完成，4-扣款失败',
+        comment: '1-计费中，2-待扣款，3-已完成，4-扣款失败，5-降级扣款，6-已中断退款',
       },
       startTime: {
         type: DataTypes.DATE,
@@ -106,10 +113,20 @@ module.exports = (sequelize) => {
         allowNull: true,
         field: 'paid_at',
       },
+      interruptedAt: {
+        type: DataTypes.DATE,
+        allowNull: true,
+        field: 'interrupted_at',
+      },
       failReason: {
         type: DataTypes.STRING(256),
         allowNull: true,
         field: 'fail_reason',
+      },
+      interruptReason: {
+        type: DataTypes.STRING(256),
+        allowNull: true,
+        field: 'interrupt_reason',
       },
       createdAt: {
         type: DataTypes.DATE,

@@ -46,6 +46,30 @@ module.exports = (sequelize) => {
         defaultValue: 0,
         field: 'water_pressure',
       },
+      foamLevel: {
+        type: DataTypes.DECIMAL(5, 2),
+        allowNull: false,
+        defaultValue: 100.0,
+        field: 'foam_level',
+        comment: '泡沫液位百分比 0-100',
+      },
+      waterLevel: {
+        type: DataTypes.DECIMAL(5, 2),
+        allowNull: false,
+        defaultValue: 100.0,
+        field: 'water_level',
+        comment: '清水液位百分比 0-100',
+      },
+      lastFaultTime: {
+        type: DataTypes.DATE,
+        allowNull: true,
+        field: 'last_fault_time',
+      },
+      lastFaultType: {
+        type: DataTypes.STRING(64),
+        allowNull: true,
+        field: 'last_fault_type',
+      },
       createdAt: {
         type: DataTypes.DATE,
         allowNull: false,

@@ -10,6 +10,7 @@ const {
 } = require('../models');
 const { redis, KeyBuilder } = require('../config/redis');
 const config = require('../config');
+const { sendEmergencyInterrupt } = require('../services/billingServiceClient');
 
 const GUN_TYPE_WATER = 1;
 const GUN_TYPE_FOAM = 2;
@@ -23,6 +24,185 @@ const DEVICE_STATUS_FAULT = 3;
 
 const SESSION_STATUS_ACTIVE = 1;
 const SESSION_STATUS_ENDED = 2;
+
+const FAULT_LEVEL_WARNING = 1;
+const FAULT_LEVEL_INTERRUPT = 2;
+const FAULT_LEVEL_CRITICAL = 3;
+
+const FAULT_TYPE_FOAM_LOW = 'FOAM_LOW';
+const FAULT_TYPE_WATER_EMPTY = 'WATER_EMPTY';
+const FAULT_TYPE_PRESSURE_DROP = 'WATER_PRESSURE_DROP';
+const FAULT_TYPE_WATER_GUN = 'WATER_GUN_FAULT';
+const FAULT_TYPE_FOAM_GUN = 'FOAM_GUN_FAULT';
+const FAULT_TYPE_GENERAL = 'GENERAL_FAULT';
+
+const GUN_FAULT_CODES = new Set([
+  'W001',
+  'W002',
+  'W003',
+  'F001',
+  'F002',
+  'F003',
+]);
+
+const detectHardwareFault = (payload, device) => {
+  const faults = [];
+
+  if (payload.waterLevel !== undefined && payload.waterLevel <= 5) {
+    faults.push({
+      faultType: FAULT_TYPE_WATER_EMPTY,
+      faultCode: 'LEV_W001',
+      faultMessage: `清水液位过低，当前 ${payload.waterLevel}%`,
+      faultLevel: FAULT_LEVEL_INTERRUPT,
+    });
+  }
+
+  if (payload.foamLevel !== undefined && payload.foamLevel <= 5) {
+    faults.push({
+      faultType: FAULT_TYPE_FOAM_LOW,
+      faultCode: 'LEV_F001',
+      faultMessage: `泡沫液位过低，当前 ${payload.foamLevel}%`,
+      faultLevel: FAULT_LEVEL_INTERRUPT,
+    });
+  }
+
+  const prevPressure =
+    device && device.waterPressure !== undefined && device.waterPressure !== null
+      ? parseFloat(device.waterPressure)
+      : null;
+  const currPressure =
+    payload.waterPressure !== undefined && payload.waterPressure !== null
+      ? parseFloat(payload.waterPressure)
+      : null;
+
+  if (currPressure !== null && currPressure < 0.5) {
+    if (
+      prevPressure === null ||
+      (prevPressure !== null && prevPressure - currPressure >= 1.0) ||
+      currPressure < 0.2
+    ) {
+      faults.push({
+        faultType: FAULT_TYPE_PRESSURE_DROP,
+        faultCode: 'PRS_D001',
+        faultMessage: `水管压力骤降，当前 ${currPressure} MPa${
+          prevPressure !== null ? `，之前 ${prevPressure} MPa` : ''
+        }`,
+        faultLevel: currPressure < 0.2 ? FAULT_LEVEL_CRITICAL : FAULT_LEVEL_INTERRUPT,
+      });
+    }
+  }
+
+  if (payload.faultCode) {
+    const code = String(payload.faultCode).toUpperCase();
+    let gunFault = null;
+    if (code.startsWith('W')) {
+      gunFault = FAULT_TYPE_WATER_GUN;
+    } else if (code.startsWith('F')) {
+      gunFault = FAULT_TYPE_FOAM_GUN;
+    } else if (GUN_FAULT_CODES.has(code) || code.includes('GUN')) {
+      gunFault = code.includes('FOAM') || code.startsWith('F')
+        ? FAULT_TYPE_FOAM_GUN
+        : FAULT_TYPE_WATER_GUN;
+    }
+
+    faults.push({
+      faultType: payload.faultType || gunFault || FAULT_TYPE_GENERAL,
+      faultCode: payload.faultCode,
+      faultMessage: payload.faultMessage || '设备上报故障码',
+      faultLevel: FAULT_LEVEL_INTERRUPT,
+    });
+  }
+
+  if (payload.faultType && !faults.find((f) => f.faultType === payload.faultType)) {
+    faults.push({
+      faultType: payload.faultType,
+      faultCode: payload.faultCode || 'CUSTOM',
+      faultMessage: payload.faultMessage || '设备上报硬件异常',
+      faultLevel: FAULT_LEVEL_INTERRUPT,
+    });
+  }
+
+  if (faults.length === 0) return null;
+
+  const critical = faults.find((f) => f.faultLevel === FAULT_LEVEL_CRITICAL);
+  const interrupt = faults.find((f) => f.faultLevel >= FAULT_LEVEL_INTERRUPT);
+
+  return {
+    primary: critical || interrupt || faults[0],
+    allFaults: faults,
+    shouldInterrupt: faults.some((f) => f.faultLevel >= FAULT_LEVEL_INTERRUPT),
+  };
+};
+
+const closeAllGunsInSession = async (sessionId, deviceNo, reportTime, t) => {
+  const sessionKey = KeyBuilder.deviceSession(sessionId);
+  const cached = await redis.get(sessionKey);
+  const sessionData = cached ? JSON.parse(cached) : null;
+
+  if (!sessionData) return { sessionData: null, closed: false };
+
+  let changed = false;
+
+  if (sessionData.waterGunOpen && sessionData.waterGunOpenTime) {
+    const openTime = new Date(sessionData.waterGunOpenTime);
+    const duration = Math.floor((reportTime.getTime() - openTime.getTime()) / 1000);
+    if (duration > 0) {
+      sessionData.waterGunTotalTime += duration;
+      await DeviceSession.increment(
+        { waterGunTotalTime: duration },
+        { where: { sessionId }, transaction: t }
+      );
+    }
+    sessionData.waterGunOpen = false;
+    sessionData.waterGunOpenTime = null;
+    await GunTimeSegment.create(
+      {
+        sessionId,
+        deviceNo,
+        gunType: GUN_TYPE_WATER,
+        actionType: ACTION_CLOSE,
+        actionTime: reportTime,
+      },
+      { transaction: t }
+    );
+    changed = true;
+  }
+
+  if (sessionData.foamGunOpen && sessionData.foamGunOpenTime) {
+    const openTime = new Date(sessionData.foamGunOpenTime);
+    const duration = Math.floor((reportTime.getTime() - openTime.getTime()) / 1000);
+    if (duration > 0) {
+      sessionData.foamGunTotalTime += duration;
+      await DeviceSession.increment(
+        { foamGunTotalTime: duration },
+        { where: { sessionId }, transaction: t }
+      );
+    }
+    sessionData.foamGunOpen = false;
+    sessionData.foamGunOpenTime = null;
+    await GunTimeSegment.create(
+      {
+        sessionId,
+        deviceNo,
+        gunType: GUN_TYPE_FOAM,
+        actionType: ACTION_CLOSE,
+        actionTime: reportTime,
+      },
+      { transaction: t }
+    );
+    changed = true;
+  }
+
+  if (changed) {
+    await redis.setex(
+      sessionKey,
+      config.ttl.session,
+      JSON.stringify(sessionData)
+    );
+  }
+
+  return { sessionData, closed: changed };
+};
 
 const startSessionSchema = Joi.object({
   deviceNo: Joi.string().required().trim().max(64).messages({
@@ -67,8 +247,12 @@ const reportStatusSchema = Joi.object({
     then: Joi.number().min(-180).max(180),
   }),
   waterFlowRate: Joi.number().min(0).default(0),
+  foamLevel: Joi.number().min(0).max(100).default(100),
+  waterLevel: Joi.number().min(0).max(100).default(100),
+  waterPressure: Joi.number().min(0).max(10).default(0),
   faultCode: Joi.string().allow(null, '').trim().max(32),
   faultMessage: Joi.string().allow(null, '').trim().max(256),
+  faultType: Joi.string().allow(null, '').trim().max(64),
 });
 
 const startSession = async (req, res, next) => {
@@ -317,14 +501,18 @@ const reportStatus = async (req, res, next) => {
 
     const {
       deviceNo,
-      sessionId,
+      sessionId: incomingSessionId,
       waterGun,
       foamGun,
       latitude,
       longitude,
       waterFlowRate,
+      foamLevel,
+      waterLevel,
+      waterPressure,
       faultCode,
       faultMessage,
+      faultType: explicitFaultType,
     } = value;
 
     const device = await Device.findOne({ where: { deviceNo } });
@@ -337,66 +525,188 @@ const reportStatus = async (req, res, next) => {
     }
 
     const reportTime = new Date();
-
-    await DeviceStatusLog.create({
-      deviceNo,
-      sessionId: sessionId || null,
-      waterGun,
-      foamGun,
-      latitude: latitude || null,
-      longitude: longitude || null,
-      waterFlowRate: waterFlowRate || 0,
+    const sensorPayload = {
+      foamLevel,
+      waterLevel,
+      waterPressure,
       faultCode: faultCode || null,
       faultMessage: faultMessage || null,
-      reportedAt: reportTime,
-    });
+      faultType: explicitFaultType || null,
+    };
 
-    if (latitude && longitude) {
-      await Device.update(
+    const faultInfo = detectHardwareFault(sensorPayload, device);
+    const effectiveFaultType = faultInfo
+      ? faultInfo.primary.faultType
+      : explicitFaultType || null;
+    const effectiveFaultMessage = faultInfo
+      ? faultInfo.primary.faultMessage
+      : faultMessage || null;
+    const effectiveFaultCode = faultInfo
+      ? faultInfo.primary.faultCode
+      : faultCode || null;
+
+    let effectiveWaterGun = waterGun;
+    let effectiveFoamGun = foamGun;
+    let sessionId = incomingSessionId;
+    let interruptTriggered = false;
+    let interruptResult = null;
+
+    const t = await sequelize.transaction();
+    try {
+      if (faultInfo && faultInfo.shouldInterrupt) {
+        effectiveWaterGun = 0;
+        effectiveFoamGun = 0;
+
+        const activeSessionKey = KeyBuilder.deviceActiveSession(deviceNo);
+        const activeSessionId = await redis.get(activeSessionKey);
+        if (activeSessionId && !sessionId) {
+          sessionId = activeSessionId;
+        }
+
+        if (sessionId) {
+          const closed = await closeAllGunsInSession(
+            sessionId,
+            deviceNo,
+            reportTime,
+            t
+          );
+
+          await DeviceSession.update(
+            {
+              status: SESSION_STATUS_ENDED,
+              endTime: reportTime,
+            },
+            { where: { sessionId }, transaction: t }
+          );
+
+          await redis.del(activeSessionKey);
+
+          interruptTriggered = true;
+
+          setImmediate(async () => {
+            try {
+              const billingResp = await sendEmergencyInterrupt({
+                deviceNo,
+                sessionId: sessionId || null,
+                faultType: faultInfo.primary.faultType,
+                faultCode: faultInfo.primary.faultCode,
+                faultMessage: faultInfo.primary.faultMessage,
+                faultLevel: faultInfo.primary.faultLevel,
+                sensorData: {
+                  foamLevel,
+                  waterLevel,
+                  waterPressure,
+                  waterGun,
+                  foamGun,
+                  waterFlowRate,
+                },
+                triggerSource: 'device_auto',
+              });
+              console.log(
+                `[HardwareInterrupt] Billing-Service 回调结果 device=${deviceNo} session=${sessionId}:`,
+                JSON.stringify(billingResp)
+              );
+            } catch (billingErr) {
+              console.error(
+                `[HardwareInterrupt] Billing-Service 回调异常 device=${deviceNo} session=${sessionId}:`,
+                billingErr.message
+              );
+            }
+          });
+
+          interruptResult = {
+            faultType: faultInfo.primary.faultType,
+            faultMessage: faultInfo.primary.faultMessage,
+            faultLevel: faultInfo.primary.faultLevel,
+            sessionId,
+          };
+        }
+
+        await Device.update(
+          {
+            status: DEVICE_STATUS_FAULT,
+            waterPressure,
+            foamLevel,
+            waterLevel,
+            lastFaultTime: reportTime,
+            lastFaultType: faultInfo.primary.faultType,
+            ...(latitude !== undefined ? { latitude } : {}),
+            ...(longitude !== undefined ? { longitude } : {}),
+          },
+          { where: { deviceNo }, transaction: t }
+        );
+      } else {
+        await Device.update(
+          {
+            ...(latitude !== undefined && longitude !== undefined
+              ? { latitude, longitude }
+              : {}),
+            waterPressure,
+            foamLevel,
+            waterLevel,
+            status:
+              device.status === DEVICE_STATUS_OFFLINE
+                ? DEVICE_STATUS_IDLE
+                : device.status,
+          },
+          { where: { deviceNo }, transaction: t }
+        );
+      }
+
+      await DeviceStatusLog.create(
         {
-          latitude,
-          longitude,
-          ...(faultCode
-            ? { status: DEVICE_STATUS_FAULT }
-            : device.status === DEVICE_STATUS_OFFLINE
-            ? { status: DEVICE_STATUS_IDLE }
-            : {}),
+          deviceNo,
+          sessionId: sessionId || null,
+          waterGun: effectiveWaterGun,
+          foamGun: effectiveFoamGun,
+          latitude: latitude || null,
+          longitude: longitude || null,
+          waterFlowRate: waterFlowRate || 0,
+          foamLevel,
+          waterLevel,
+          waterPressure,
+          faultCode: effectiveFaultCode,
+          faultMessage: effectiveFaultMessage,
+          faultType: effectiveFaultType,
+          reportedAt: reportTime,
         },
-        { where: { deviceNo } }
+        { transaction: t }
       );
-    } else if (faultCode) {
-      await Device.update(
-        { status: DEVICE_STATUS_FAULT },
-        { where: { deviceNo } }
-      );
-    } else if (
-      device.status === DEVICE_STATUS_OFFLINE ||
-      device.status === DEVICE_STATUS_FAULT
-    ) {
-      await Device.update(
-        { status: DEVICE_STATUS_IDLE },
-        { where: { deviceNo } }
-      );
+
+      await t.commit();
+    } catch (txErr) {
+      if (!t.finished) await t.rollback();
+      throw txErr;
     }
+
+    const finalDeviceStatus = faultInfo
+      ? DEVICE_STATUS_FAULT
+      : device.status === DEVICE_STATUS_OFFLINE
+      ? DEVICE_STATUS_IDLE
+      : device.status;
 
     await redis.setex(
       KeyBuilder.deviceStatus(deviceNo),
       config.ttl.deviceStatus,
       JSON.stringify({
         deviceNo,
-        status: faultCode ? DEVICE_STATUS_FAULT : device.status,
-        waterGun,
-        foamGun,
+        status: finalDeviceStatus,
+        waterGun: effectiveWaterGun,
+        foamGun: effectiveFoamGun,
         latitude: latitude || device.latitude,
         longitude: longitude || device.longitude,
         waterFlowRate: waterFlowRate || 0,
-        faultCode: faultCode || null,
-        faultMessage: faultMessage || null,
+        foamLevel,
+        waterLevel,
+        waterPressure,
+        faultCode: effectiveFaultCode,
+        faultMessage: effectiveFaultMessage,
+        faultType: effectiveFaultType,
         reportedAt: reportTime.toISOString(),
       })
     );
 
-    if (sessionId) {
+    if (sessionId && !interruptTriggered) {
       const sessionKey = KeyBuilder.deviceSession(sessionId);
       let cached = await redis.get(sessionKey);
       let sessionData = cached ? JSON.parse(cached) : null;
@@ -421,10 +731,10 @@ const reportStatus = async (req, res, next) => {
         }
       }
 
-      if (sessionData) {
-        const t = await sequelize.transaction();
+      if (sessionData && sessionData.status === SESSION_STATUS_ACTIVE) {
+        const st = await sequelize.transaction();
         try {
-          if (waterGun === 1 && !sessionData.waterGunOpen) {
+          if (effectiveWaterGun === 1 && !sessionData.waterGunOpen) {
             sessionData.waterGunOpen = true;
             sessionData.waterGunOpenTime = reportTime.toISOString();
 
@@ -436,9 +746,12 @@ const reportStatus = async (req, res, next) => {
                 actionType: ACTION_OPEN,
                 actionTime: reportTime,
               },
-              { transaction: t }
+              { transaction: st }
             );
-          } else if (waterGun === 0 && sessionData.waterGunOpen) {
+          } else if (
+            effectiveWaterGun === 0 &&
+            sessionData.waterGunOpen
+          ) {
             const openTime = new Date(sessionData.waterGunOpenTime);
             const duration = Math.floor(
               (reportTime.getTime() - openTime.getTime()) / 1000
@@ -461,7 +774,7 @@ const reportStatus = async (req, res, next) => {
                 actionType: ACTION_CLOSE,
                 actionTime: reportTime,
               },
-              { transaction: t }
+              { transaction: st }
             );
 
             await DeviceSession.increment(
@@ -469,11 +782,11 @@ const reportStatus = async (req, res, next) => {
                 waterGunTotalTime: duration,
                 totalWaterVolume: volumeUsed,
               },
-              { where: { sessionId }, transaction: t }
+              { where: { sessionId }, transaction: st }
             );
           }
 
-          if (foamGun === 1 && !sessionData.foamGunOpen) {
+          if (effectiveFoamGun === 1 && !sessionData.foamGunOpen) {
             sessionData.foamGunOpen = true;
             sessionData.foamGunOpenTime = reportTime.toISOString();
 
@@ -485,9 +798,9 @@ const reportStatus = async (req, res, next) => {
                 actionType: ACTION_OPEN,
                 actionTime: reportTime,
               },
-              { transaction: t }
+              { transaction: st }
             );
-          } else if (foamGun === 0 && sessionData.foamGunOpen) {
+          } else if (effectiveFoamGun === 0 && sessionData.foamGunOpen) {
             const openTime = new Date(sessionData.foamGunOpenTime);
             const duration = Math.floor(
               (reportTime.getTime() - openTime.getTime()) / 1000
@@ -504,16 +817,16 @@ const reportStatus = async (req, res, next) => {
                 actionType: ACTION_CLOSE,
                 actionTime: reportTime,
               },
-              { transaction: t }
+              { transaction: st }
             );
 
             await DeviceSession.increment(
               { foamGunTotalTime: duration },
-              { where: { sessionId }, transaction: t }
+              { where: { sessionId }, transaction: st }
             );
           }
 
-          await t.commit();
+          await st.commit();
 
           await redis.setex(
             sessionKey,
@@ -521,19 +834,33 @@ const reportStatus = async (req, res, next) => {
             JSON.stringify(sessionData)
           );
         } catch (innerErr) {
-          await t.rollback();
+          if (!st.finished) await st.rollback();
           throw innerErr;
         }
       }
     }
 
+    const responseData = {
+      deviceNo,
+      reportedAt: reportTime.toISOString(),
+      deviceStatus: finalDeviceStatus,
+      waterGun: effectiveWaterGun,
+      foamGun: effectiveFoamGun,
+    };
+
+    if (interruptTriggered) {
+      responseData.fault = {
+        ...interruptResult,
+        interruptTriggered: true,
+      };
+    }
+
     res.status(200).json({
       code: 200,
-      message: '状态上报成功',
-      data: {
-        deviceNo,
-        reportedAt: reportTime.toISOString(),
-      },
+      message: interruptTriggered
+        ? `检测到硬件异常（${effectiveFaultMessage || effectiveFaultType}），已自动关枪并进入故障维护`
+        : '状态上报成功',
+      data: responseData,
     });
   } catch (err) {
     next(err);
@@ -643,11 +970,16 @@ const getDeviceStatus = async (req, res, next) => {
       latitude: parseFloat(device.latitude),
       longitude: parseFloat(device.longitude),
       waterPressure: parseFloat(device.waterPressure),
+      foamLevel: parseFloat(device.foamLevel),
+      waterLevel: parseFloat(device.waterLevel),
+      lastFaultTime: device.lastFaultTime ? device.lastFaultTime.toISOString() : null,
+      lastFaultType: device.lastFaultType || null,
       waterGun: latestLog ? latestLog.waterGun : 0,
       foamGun: latestLog ? latestLog.foamGun : 0,
       waterFlowRate: latestLog ? parseFloat(latestLog.waterFlowRate) : 0,
       faultCode: latestLog ? latestLog.faultCode : null,
       faultMessage: latestLog ? latestLog.faultMessage : null,
+      faultType: latestLog ? latestLog.faultType : null,
       reportedAt: latestLog ? latestLog.reportedAt.toISOString() : null,
     };
 

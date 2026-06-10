@@ -164,9 +164,12 @@ const deductFromWallet = async (userId, amount, orderNo, remark) => {
   }
 };
 
-const getTransactionByOrderNo = async (orderNo) => {
+const getTransactionByOrderNo = async (orderNo, txType) => {
+  const where = { orderNo };
+  if (txType) where.txType = txType;
+
   const tx = await WalletTransaction.findOne({
-    where: { orderNo },
+    where,
     order: [['createdAt', 'DESC']],
   });
 
@@ -185,9 +188,102 @@ const getTransactionByOrderNo = async (orderNo) => {
   };
 };
 
+const refundToWallet = async (userId, amount, orderNo, remark) => {
+  if (amount <= 0) {
+    throw new Error('退款金额必须大于0');
+  }
+
+  const lock = await acquireWalletLock(userId);
+
+  try {
+    const t = await sequelize.transaction();
+
+    try {
+      const user = await User.findByPk(userId, {
+        attributes: ['id', 'walletBalance', 'status', 'totalConsumption'],
+        transaction: t,
+        lock: t.LOCK.UPDATE,
+      });
+
+      if (!user) {
+        await t.rollback();
+        throw new Error('用户不存在');
+      }
+
+      if (user.status !== 1) {
+        await t.rollback();
+        throw new Error('用户账户已被冻结');
+      }
+
+      const existingRefund = await getTransactionByOrderNo(orderNo, TX_TYPE_REFUND);
+      if (existingRefund) {
+        await t.rollback();
+        const error = new Error('该订单已存在退款记录');
+        error.code = 'DUPLICATE_REFUND';
+        throw error;
+      }
+
+      const balanceBefore = parseFloat(user.walletBalance);
+      const balanceAfter = parseFloat((balanceBefore + amount).toFixed(2));
+
+      const newTotalConsumption = parseFloat(
+        Math.max(0, parseFloat(user.totalConsumption) - amount).toFixed(2)
+      );
+
+      await User.update(
+        {
+          walletBalance: balanceAfter,
+          totalConsumption: newTotalConsumption,
+        },
+        {
+          where: { id: userId },
+          transaction: t,
+        }
+      );
+
+      const txNo = `TX${Date.now()}${Math.random().toString(36).slice(2, 8).toUpperCase()}R`;
+
+      await WalletTransaction.create(
+        {
+          txNo,
+          userId,
+          orderNo: orderNo || null,
+          txType: TX_TYPE_REFUND,
+          amount: Math.abs(amount),
+          balanceBefore,
+          balanceAfter,
+          remark: remark || '退款',
+        },
+        { transaction: t }
+      );
+
+      await t.commit();
+
+      await invalidateWalletCache(userId);
+
+      return {
+        success: true,
+        txNo,
+        orderNo: orderNo || null,
+        amount,
+        balanceBefore,
+        balanceAfter,
+      };
+    } catch (innerError) {
+      if (!t.finished) {
+        await t.rollback();
+      }
+      throw innerError;
+    }
+  } finally {
+    await releaseWalletLock(lock.lockKey, lock.lockValue);
+  }
+};
+
 module.exports = {
   getUserWallet,
   deductFromWallet,
+  refundToWallet,
   getTransactionByOrderNo,
   invalidateWalletCache,
   TX_TYPE_RECHARGE,

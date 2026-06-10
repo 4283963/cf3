@@ -9,6 +9,7 @@ const { testConnection } = require('./config/database');
 require('./config/redis');
 
 const billingRoutes = require('./routes/billingRoutes');
+const emergencyRoutes = require('./routes/emergencyRoutes');
 const {
   errorHandler,
   notFoundHandler,
@@ -36,6 +37,7 @@ app.get('/health', (req, res) => {
 });
 
 app.use('/api/billing', billingRoutes);
+app.use('/api/emergency', emergencyRoutes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);
