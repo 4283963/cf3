@@ -4,6 +4,7 @@ const User = require('./User')(sequelize);
 const BillingRule = require('./BillingRule')(sequelize);
 const BillingOrder = require('./BillingOrder')(sequelize);
 const WalletTransaction = require('./WalletTransaction')(sequelize);
+const DeviceSession = require('./DeviceSession')(sequelize);
 
 User.hasMany(BillingOrder, {
   foreignKey: 'userId',
@@ -41,10 +42,23 @@ WalletTransaction.belongsTo(BillingOrder, {
   as: 'order',
 });
 
+DeviceSession.hasMany(BillingOrder, {
+  foreignKey: 'sessionId',
+  sourceKey: 'sessionId',
+  as: 'billingOrders',
+});
+
+BillingOrder.belongsTo(DeviceSession, {
+  foreignKey: 'sessionId',
+  targetKey: 'sessionId',
+  as: 'deviceSession',
+});
+
 module.exports = {
   sequelize,
   User,
   BillingRule,
   BillingOrder,
   WalletTransaction,
+  DeviceSession,
 };

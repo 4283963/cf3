@@ -28,8 +28,29 @@ module.exports = {
 
   deviceService: {
     baseUrl: process.env.DEVICE_SERVICE_BASE_URL || 'http://127.0.0.1:3001',
-    timeout: parseInt(process.env.DEVICE_SERVICE_TIMEOUT, 10) || 5000,
     internalApiToken: process.env.INTERNAL_API_TOKEN || 'dev-internal-token-2024',
+
+    timeout: {
+      connectTimeout: parseInt(process.env.DEVICE_CONNECT_TIMEOUT, 10) || 2000,
+      readTimeout: parseInt(process.env.DEVICE_READ_TIMEOUT, 10) || 3000,
+      maxConnections: parseInt(process.env.DEVICE_MAX_CONNECTIONS, 10) || 20,
+      maxFreeConnections: parseInt(process.env.DEVICE_MAX_FREE_CONNECTIONS, 10) || 10,
+    },
+
+    circuitBreaker: {
+      failureThreshold: parseInt(process.env.CB_FAILURE_THRESHOLD, 10) || 5,
+      failureWindowMs: parseInt(process.env.CB_FAILURE_WINDOW_MS, 10) || 60000,
+      openDurationMs: parseInt(process.env.CB_OPEN_DURATION_MS, 10) || 30000,
+      halfOpenMaxAttempts: parseInt(process.env.CB_HALF_OPEN_MAX_ATTEMPTS, 10) || 2,
+      halfOpenSuccessThreshold: parseInt(process.env.CB_HALF_OPEN_SUCCESS_THRESHOLD, 10) || 2,
+    },
+
+    retry: {
+      maxRetries: parseInt(process.env.RETRY_MAX_RETRIES, 10) || 2,
+      baseDelayMs: parseInt(process.env.RETRY_BASE_DELAY_MS, 10) || 200,
+      maxDelayMs: parseInt(process.env.RETRY_MAX_DELAY_MS, 10) || 3000,
+      jitterFactor: parseFloat(process.env.RETRY_JITTER_FACTOR) || 0.25,
+    },
   },
 
   ttl: {
